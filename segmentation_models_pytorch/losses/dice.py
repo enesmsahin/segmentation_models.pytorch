@@ -19,6 +19,7 @@ class DiceLoss(_Loss):
         smooth: float = 0.0,
         ignore_index: Optional[int] = None,
         eps: float = 1e-7,
+        class_weights: Optional[List[int]] = None,
     ):
         """Dice loss for image segmentation task.
         It supports binary, multiclass and multilabel cases
@@ -32,6 +33,7 @@ class DiceLoss(_Loss):
             ignore_index: Label that indicates ignored pixels (does not contribute to loss)
             eps: A small epsilon for numerical stability to avoid zero division error
                 (denominator will be always greater or equal to eps)
+            class_weights: List of weights for each class. If None, weights are equal to 1.0. Example: [0.2, 0.2, 0.6]
 
         Shape
              - **y_pred** - torch.Tensor of shape (N, C, H, W)
@@ -53,10 +55,29 @@ class DiceLoss(_Loss):
         self.eps = eps
         self.log_loss = log_loss
         self.ignore_index = ignore_index
+        self.class_weights = class_weights
+        self.__name__ = "DiceLoss"
+
+        if self.class_weights is not None:
+            sum_of_weights = sum(self.class_weights)
+            self.class_weights = [cls_weight / sum_of_weights for cls_weight in self.class_weights]
+
+        self.class_weights_tensor = None
 
     def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
 
         assert y_true.size(0) == y_pred.size(0)
+
+        if self.class_weights is None:
+            self.class_weights = [1 / y_true.size(1)] * y_true.size(1)
+        assert len(self.class_weights) == y_true.size(1)
+
+        if self.class_weights_tensor is None:
+            if isinstance(self.class_weights, torch.Tensor):
+                self.class_weights_tensor = self.class_weights.clone().detach()
+            else:
+                self.class_weights_tensor = torch.tensor(self.class_weights)
+            self.class_weights_tensor = self.class_weights_tensor.to(y_pred.device)
 
         if self.from_logits:
             # Apply activations to get [0..1] class probabilities
@@ -81,18 +102,19 @@ class DiceLoss(_Loss):
                 y_true = y_true * mask
 
         if self.mode == MULTICLASS_MODE:
-            y_true = y_true.view(bs, -1)
+            y_true = y_true.view(bs, num_classes, -1)
             y_pred = y_pred.view(bs, num_classes, -1)
 
             if self.ignore_index is not None:
                 mask = y_true != self.ignore_index
                 y_pred = y_pred * mask.unsqueeze(1)
 
-                y_true = F.one_hot((y_true * mask).to(torch.long), num_classes)  # N,H*W -> N,H*W, C
-                y_true = y_true.permute(0, 2, 1) * mask.unsqueeze(1)  # N, C, H*W
+                # y_true = F.one_hot((y_true * mask).to(torch.long), num_classes)  # N,H*W -> N,H*W, C
+                # y_true = y_true.permute(0, 2, 1) * mask.unsqueeze(1)  # N, C, H*W
             else:
-                y_true = F.one_hot(y_true, num_classes)  # N,H*W -> N,H*W, C
-                y_true = y_true.permute(0, 2, 1)  # N, C, H*W
+                # y_true = F.one_hot(y_true, num_classes)  # N,H*W -> N,H*W, C
+                # y_true = y_true.permute(0, 2, 1)  # N, C, H*W
+                pass
 
         if self.mode == MULTILABEL_MODE:
             y_true = y_true.view(bs, num_classes, -1)
@@ -110,6 +132,8 @@ class DiceLoss(_Loss):
         else:
             loss = 1.0 - scores
 
+        loss = torch.multiply(loss, self.class_weights_tensor)
+
         # Dice loss is undefined for non-empty classes
         # So we zero contribution of channel that does not have true pixels
         # NOTE: A better workaround would be to use loss term `mean(y_pred)`
@@ -121,7 +145,7 @@ class DiceLoss(_Loss):
         if self.classes is not None:
             loss = loss[self.classes]
 
-        return self.aggregate_loss(loss)
+        return loss.sum()
 
     def aggregate_loss(self, loss):
         return loss.mean()
